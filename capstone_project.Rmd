@@ -1,0 +1,199 @@
+---
+title: "Course Capstone Project"
+author: "Lytemar"
+date: "October 9, 2017"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE, cache=TRUE)
+set.seed(85)
+```
+
+## Introduction
+
+The data set that we will analyze is the opening response time (ms) of an electromechanical valve.
+The valve controls the flow of several fluids where the opening and closing is actuated by a solenoid.
+The shutoff seal is an elastomer that is attached to the end of the solenoid plunger.
+In this project, we will determine how the seal vintage, fluid and applied coil voltage affects the valve's opening response time.
+
+## Exploratory Data Analysis
+
+The summary of the data set is
+
+```{r read in data and summary}
+library(rjags)
+library(ggplot2)
+df = read.csv('capstone_data_set.csv')
+df = df[, -c(1,2)]
+df$Voltage = as.factor(df$Voltage)
+prob = mean(df$Response.Time_ms[df$Voltage==30] <= df$Response.Time_ms[df$Voltage==24])
+data_resp_time = df$Response.Time_ms
+summary(df)
+```
+
+where *Valve.Rev* indicates the revision of the valve design, *Fluid* indicates the different fluids as masked factors, *Time.Between.Actuations_hr* indicates the time between valve actuations in hours, *\*.Age* indicates the age of the indicated component, *voltage* is the applied DC solenoid coil voltage, *Seal.Type* indicates the types of seal materials as masked factors, and *Response.Time_ms* is the time to open the valve in ms.
+
+### Plots
+
+In the interest of report length, we only show the following density plot that illustrates the distribution of response time.
+Additionally, box plots of response time versus the other variables would show how response time varies due to the other variables in the data set.
+Here, we see that the distribution of response time is right-skewed, therefore we will apply a log transformation before fitting a Bayesian regression model.
+
+
+```{r pairs plot of data}
+#library(GGally)
+#ggpairs(df[,c(1,2,6,9)], aes(color=Voltage, alpha=0.4))
+
+p <- ggplot(data=df, aes(x=Response.Time_ms))
+p <- p + geom_density()
+print(p)
+
+#p <- ggplot(data=df, aes(x=Response.Time_ms, color=Voltage, group=Voltage))
+#p <- p + geom_density()
+#print(p)
+
+#p <- ggplot(df, aes(Voltage, Response.Time_ms))
+#p <- p + geom_boxplot(outlier.colour = "red", outlier.shape = 1, aes(color=Fluid))
+#p <- p + + geom_jitter(width=0.2)
+#print(p)
+```
+
+## Modeling
+
+Here we will fit a Bayesian linear model from which we will see which predictors affect response time.
+The coefficients of the predictors are
+
+- b[1]: intercept,
+- b[2]: is.new.vlv,
+- b[3]: Fluid,
+- b[4]: Time.Between.Actuations_ms,
+- b[5]: is.new.plunger,
+- b[6]: is.new.coil,
+- b[7]: is.24v,
+- b[8]: is.seal_A,
+- b[9]: is.new.seal,
+- b[10]: Fluid*is.24v,
+- b[11]: is.new.seal*is.24v, and
+- b[12]: is.new.vlv*is.24v.
+
+Finally, we will compute the probability that the response time is less than 100 ms given Voltage from our MCMC results.
+
+```{r jags model}
+
+df$logresponse = log(df$Response.Time_ms)
+df$Response.Time_ms <- NULL
+
+# Convert all factors to numeric
+#indx <-sapply(df, is.factor)
+#df[indx] <- lapply(df[indx], function(x) as.numeric(x))
+df$is.new.vlv = as.numeric(df$Valve.Rev=='New')
+df$is.new.plunger = as.numeric(df$Plunger.Age=='New')
+df$is.new.coil = as.numeric(df$Coil.Age=='New')
+df$is.24v = as.numeric(df$Voltage=='24')
+df$is.seal_A = as.numeric(df$Seal.Type=='A')
+df$is.new.seal = as.numeric(df$Seal.Age=='New')
+df$Fluid = as.numeric(df$Fluid)
+
+n.interaction.terms = 3
+n.chains = 3
+n.burn.iter = 5000
+n.iter = 100000
+
+# Make model matrix for interactions
+#M = model.matrix(logresponse ~ .^2, df)
+
+mod_string = " model {
+  for (i in 1:n) {
+    y[i] ~ dnorm(mu[i], prec)
+    mu[i] = b[1]+b[2]*is.new.vlv[i]+b[3]*fluid[i]+b[4]*time[i]+b[5]*is.new.plunger[i]+b[6]*is.new.coil[i]+b[7]*is.24v[i]+b[8]*is.seal_A[i]+b[9]*is.new.seal[i]+b[10]*is.24v[i]*fluid[i]+b[11]*is.24v[i]*is.new.seal[i]+b[12]*is.24v[i]*is.new.vlv[i]
+  }
+  
+  for (j in 1:m) {
+    b[j] ~ dnorm(0.0, 1.0/1.0e2)
+  }
+  
+  prec ~ dgamma(5/2.0, 2*10.0/2.0)
+  sig2 = 1.0/prec
+  sig = sqrt(sig2)
+} "
+
+data_jags = list(n=nrow(df), 
+                 m=9+n.interaction.terms, 
+                 y=df$logresponse,
+                 is.new.vlv=df$is.new.vlv,
+                 fluid = df$Fluid,
+                 time = df$Time.Between.Actuations_hr,
+                 is.new.plunger = df$is.new.plunger,
+                 is.new.coil = df$is.new.coil,
+                 is.24v = df$is.24v,
+                 is.seal_A = df$is.seal_A,
+                 is.new.seal = df$is.new.seal
+                 )
+params = c("b", "sig2")
+mod = jags.model(textConnection(mod_string), data=data_jags, n.chains=n.chains)
+update(mod, n.burn.iter) # burn-in
+mod_sim = coda.samples(model=mod,
+                       variable.names = params,
+                       n.iter = n.iter)
+mod_csim = do.call(rbind, mod_sim) # combine multiple chains
+#gelman.diag(mod_sim)
+#autocorr.diag(mod_sim)
+#autocorr.plot(mod_sim)
+#effectiveSize(mod_sim)
+#summary(mod_sim)
+
+```
+
+Using normal likelihood, with normal priors on the coefficients and inverse gamma prior for the variance, with `r as.integer(n.burn.iter)` burn-in iterations, and `r as.integer(n.iter)` total iterations for the `r as.integer(n.chains)` chains, we get the following autocorrelation diagnostics
+
+```{r}
+autocorr.diag(mod_sim)
+```
+
+Here, we see that not all of the parameters have converged, giving the following effective sample sizes
+```{r}
+effectiveSize(mod_sim)
+```
+
+However, we are interested in the means of the coefficients which are
+```{r}
+pm_params = colMeans(mod_csim)
+pm_params
+```
+
+The plot of the residuals shows that we have some dependency on the variance with respect to the data point.
+This would need to be remedied by a different transformation on the data.
+
+```{r plot of residuals, fig.height=4, fig.width=6}
+X = as.matrix(cbind(1, df[,c(10,2,3,11,12,13,14,15)],
+          df$Fluid*df$is.24v,
+          df$is.new.seal*df$is.24v,
+          df$is.24v*df$is.new.vlv))
+last.pm.params.col=9+n.interaction.terms+1
+log_yhat = X %*% pm_params[seq(1,9+n.interaction.terms)]
+resid = data_jags$y - log_yhat
+plot(resid)
+```
+
+## Results
+The following plot superinposes the log response time distributions of the data and resulting model.
+
+```{r density plots, fig.height=3, fig.width=6}
+modeled_data = data.frame(Response.Time_ms=exp(log_yhat), vec='model')
+observed_data = data.frame(Response.Time_ms=data_resp_time, vec='observed')
+data = rbind(modeled_data, observed_data)
+p <- ggplot(data, aes(Response.Time_ms, group=vec, col=vec)) + geom_density()
+print(p)
+```
+
+Finally, using the modeled posterior distribution, the probability that the response time given 30 volts is less than given 24 volts.
+```{r}
+n_sum = nrow(mod_csim)
+X.24 = X[X[,6]==1,]
+X.30 = X[X[,6]==0,]
+mod_csim = mod_csim[, seq(1,9+n.interaction.terms)]
+prob
+```
+
+
